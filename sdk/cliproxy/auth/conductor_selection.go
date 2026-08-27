@@ -1478,10 +1478,16 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if !authSupportsRequestModalities(registryRef, candidate, model, opts.OriginalRequest) {
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if requestRequiresImageInput(opts.OriginalRequest) {
+			return nil, nil, &Error{Code: "unsupported_input_modality", Message: "no available auth supports image input for the requested model", HTTPStatus: http.StatusBadRequest}
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
@@ -1811,10 +1817,16 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if !authSupportsRequestModalities(registryRef, candidate, model, opts.OriginalRequest) {
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if requestRequiresImageInput(opts.OriginalRequest) {
+			return nil, nil, "", &Error{Code: "unsupported_input_modality", Message: "no available auth supports image input for the requested model", HTTPStatus: http.StatusBadRequest}
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
