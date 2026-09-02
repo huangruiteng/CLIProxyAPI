@@ -19,6 +19,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -921,11 +922,17 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // applies to cold bindings, requests without a session, and genuine bound-credential
 // failover, so the fallback selector only ever receives the highest available priority tier.
 //
-// Note: The cache key includes provider, session ID, and model to handle cases where
+// Note: The cache key includes provider, session ID, model, and non-text request modality to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
-// that may be supported by different auth credentials, and to avoid cross-provider conflicts.
+// or modalities that may be supported by different auth credentials, and to avoid
+// cross-provider conflicts. Text-only requests intentionally retain the legacy key.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
+	var errModalities error
+	auths, errModalities = filterAuthsForRequestModalities(registry.GetGlobalRegistry(), auths, model, opts.OriginalRequest)
+	if errModalities != nil {
+		return nil, errModalities
+	}
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
 	}
@@ -971,11 +978,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
-	cacheKey := provider + "::" + primaryID + "::" + modelKey
+	modalityKey := sessionAffinityModalityKey(opts.OriginalRequest)
+	cacheKey := provider + "::" + primaryID + "::" + modelKey + modalityKey
 	isSubagent := isSubagentSession(primaryID, fallbackID)
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey + modalityKey
 	}
 	bind := func(authID string) {
 		if fallbackKey != "" && !isSubagent {
@@ -1197,7 +1205,6 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if raw, ok := res.Options.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey].(string); ok && raw != "" {
 		nsModel = canonicalModelKey(raw)
 	}
-
 	if res.Error != nil && shouldSkipCredentialCooldown(res.Error) {
 		// Request-scoped or caller-attributed failures are not evidence that the
 		// selected credential is unhealthy, so preserve both explicit and LCP bindings.
@@ -1235,10 +1242,11 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		return
 	}
 
-	cacheKey := ns + "::" + primaryID + "::" + nsModel
+	modalityKey := sessionAffinityModalityKey(res.Options.OriginalRequest)
+	cacheKey := ns + "::" + primaryID + "::" + nsModel + modalityKey
 	var fallbackKey string
 	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) {
-		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		fallbackKey = ns + "::" + fallbackID + "::" + nsModel + modalityKey
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)

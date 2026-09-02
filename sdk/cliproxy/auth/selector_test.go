@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -2423,6 +2424,126 @@ func TestSessionAffinitySelectorUsesRequestPayloadWhenOriginalRequestMissing(t *
 	}
 	if second.ID != first.ID {
 		t.Fatalf("request-only conversation changed auth from %q to %q", first.ID, second.ID)
+	}
+}
+
+func TestRequestRequiresImageInput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "responses input image", payload: `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`, want: true},
+		{name: "chat image url", payload: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}]}`, want: true},
+		{name: "nested image url key", payload: `{"input":[{"content":[{"image_url":"data:image/png;base64,AA=="}]}]}`, want: true},
+		{name: "text only", payload: `{"input":"describe an image_url field without attaching one"}`, want: false},
+		{name: "invalid json", payload: `{`, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := requestRequiresImageInput([]byte(test.payload)); got != test.want {
+				t.Fatalf("requestRequiresImageInput() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSessionAffinitySelector_ImageRequestRejectsCachedTextOnlyAuth(t *testing.T) {
+	const model = "auto/modality-aware-test"
+	const textAuthID = "modality-affinity-a-text"
+	const visionAuthID = "modality-affinity-b-vision"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(textAuthID, "openai-compatibility", []*registry.ModelInfo{{
+		ID: model, SupportedInputModalities: []string{"text"},
+	}})
+	modelRegistry.RegisterClient(visionAuthID, "codex", []*registry.ModelInfo{{
+		ID: model, SupportedInputModalities: []string{"text", "image"},
+	}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(textAuthID)
+		modelRegistry.UnregisterClient(visionAuthID)
+	})
+
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	t.Cleanup(selector.Stop)
+	auths := []*Auth{{ID: textAuthID}, {ID: visionAuthID}}
+	textOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"modality-affinity-session"},"input":"hello"}`)}
+	first, errFirst := selector.Pick(context.Background(), "mixed", model, textOpts, auths)
+	if errFirst != nil {
+		t.Fatalf("text Pick() error = %v", errFirst)
+	}
+	if first.ID != textAuthID {
+		t.Fatalf("text Pick() auth = %q, want cached text-only auth %q", first.ID, textAuthID)
+	}
+
+	imageOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"modality-affinity-session"},"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`)}
+	second, errSecond := selector.Pick(context.Background(), "mixed", model, imageOpts, auths)
+	if errSecond != nil {
+		t.Fatalf("image Pick() error = %v", errSecond)
+	}
+	if second.ID != visionAuthID {
+		t.Fatalf("image Pick() auth = %q, want vision auth %q", second.ID, visionAuthID)
+	}
+	third, errThird := selector.Pick(context.Background(), "mixed", model, textOpts, auths)
+	if errThird != nil {
+		t.Fatalf("second text Pick() error = %v", errThird)
+	}
+	if third.ID != textAuthID {
+		t.Fatalf("second text Pick() auth = %q, want independently cached text auth %q", third.ID, textAuthID)
+	}
+	fourth, errFourth := selector.Pick(context.Background(), "mixed", model, imageOpts, auths)
+	if errFourth != nil {
+		t.Fatalf("second image Pick() error = %v", errFourth)
+	}
+	if fourth.ID != visionAuthID {
+		t.Fatalf("second image Pick() auth = %q, want independently cached vision auth %q", fourth.ID, visionAuthID)
+	}
+}
+
+func TestSessionAffinitySelector_ImageRequestFailsClosedWithOnlyTextAuth(t *testing.T) {
+	const model = "auto/modality-aware-text-only-test"
+	const authID = "modality-affinity-only-text"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "openai-compatibility", []*registry.ModelInfo{{
+		ID: model, SupportedInputModalities: []string{"text"},
+	}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	t.Cleanup(selector.Stop)
+	_, errPick := selector.Pick(context.Background(), "mixed", model, cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"input":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}`),
+	}, []*Auth{{ID: authID}})
+	var authErr *Error
+	if !errors.As(errPick, &authErr) {
+		t.Fatalf("Pick() error = %v, want *Error", errPick)
+	}
+	if authErr.Code != "unsupported_input_modality" || authErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("Pick() error = %+v, want unsupported_input_modality 400", authErr)
+	}
+}
+
+func TestSessionAffinitySelector_ExplicitVisionModelAcceptsImage(t *testing.T) {
+	const model = "codex-b/modality-aware-test"
+	const authID = "modality-affinity-explicit-vision"
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(authID, "codex", []*registry.ModelInfo{{
+		ID: model, SupportedInputModalities: []string{"text", "image"},
+	}})
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	t.Cleanup(selector.Stop)
+	picked, errPick := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"input":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}`),
+	}, []*Auth{{ID: authID}})
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if picked.ID != authID {
+		t.Fatalf("Pick() auth = %q, want %q", picked.ID, authID)
 	}
 }
 
