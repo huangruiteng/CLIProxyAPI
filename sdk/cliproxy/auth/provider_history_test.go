@@ -305,6 +305,39 @@ func TestManagerNormalizesHistoryOnlyWhenSessionChangesUpstreamScope(t *testing.
 	}
 }
 
+func TestManagerDropsRecoverableOrphanHostOutputForCompatibleModelWithoutHandoff(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	t.Cleanup(manager.StopAutoRefresh)
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"continue"},{"type":"function_call_output","name":"automation_update","output":"{}"}]}`)
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		OriginalRequest: bytes.Clone(body),
+		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthMetadataKey:               "ark",
+			cliproxyexecutor.SelectedModelCompatibilityMetadataKey: true,
+		},
+	}
+
+	got, gotOpts, err := manager.applyRequestAfterAuthInterceptor(
+		nil,
+		nil,
+		&Auth{ID: "ark", Provider: "codex"},
+		"codex",
+		cliproxyexecutor.Request{Payload: bytes.Clone(body)},
+		opts,
+		"deepseek-v4-flash-ga-260731",
+	)
+	if err != nil {
+		t.Fatalf("compatible same-scope request error = %v", err)
+	}
+	if gjson.GetBytes(got.Payload, "input.#").Int() != 1 || bytes.Contains(got.Payload, []byte("automation_update")) {
+		t.Fatalf("recoverable orphan host output survived: %s", got.Payload)
+	}
+	if !bytes.Equal(got.Payload, gotOpts.OriginalRequest) {
+		t.Fatalf("translated payload and OriginalRequest diverged")
+	}
+}
+
 func TestManagerTracksStablePromptCacheAliasAcrossRequestIDs(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	t.Cleanup(manager.StopAutoRefresh)

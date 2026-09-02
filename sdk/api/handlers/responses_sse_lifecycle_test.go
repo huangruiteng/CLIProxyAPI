@@ -213,6 +213,46 @@ func TestResponsesSSELifecycleWaitsForFrameDelimiterBeforeForwarding(t *testing.
 	}
 }
 
+func TestResponsesSSEValidatorFramesDelimiterlessChunksForLifecycle(t *testing.T) {
+	validator := &sseJSONValidationState{canonicalizeCompleteFrames: true}
+	lifecycle := &responsesSSELifecycleState{}
+	chunks := []string{
+		`data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"answer"}`,
+		`data: {"type":"response.completed","response":{"id":"resp1","status":"completed"}}`,
+		`data: [DONE]`,
+	}
+
+	var output []byte
+	for _, chunk := range chunks {
+		validated, err := validator.AddChunk([]byte(chunk))
+		if err != nil {
+			t.Fatalf("validator AddChunk() error = %v", err)
+		}
+		if !bytes.HasSuffix(validated, []byte("\n\n")) {
+			t.Fatalf("validated chunk lacks SSE frame delimiter: %q", validated)
+		}
+		normalized, err := lifecycle.AddChunk(validated)
+		if err != nil {
+			t.Fatalf("lifecycle AddChunk() error = %v", err)
+		}
+		output = append(output, normalized...)
+	}
+	if err := validator.Finish(); err != nil {
+		t.Fatalf("validator Finish() error = %v", err)
+	}
+	if err := lifecycle.Finish(); err != nil {
+		t.Fatalf("lifecycle Finish() error = %v", err)
+	}
+	if got := responsesSSETestEventNames(output); !equalStrings(got, []string{
+		"response.output_item.added",
+		"response.output_text.delta",
+		"response.output_item.done",
+		"response.completed",
+	}) {
+		t.Fatalf("event fields = %#v; output=%s", got, output)
+	}
+}
+
 func TestResponsesSSELifecycleSynthesizesMessageBeforeContentPart(t *testing.T) {
 	state := &responsesSSELifecycleState{}
 	chunks := []string{

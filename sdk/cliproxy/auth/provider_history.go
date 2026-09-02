@@ -181,6 +181,41 @@ func providerHistoryIsRecoverableOrphanHostOutput(item map[string]any, items []a
 	return true
 }
 
+func dropRecoverableOrphanHostOutputs(body []byte) ([]byte, bool) {
+	var request map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&request) != nil {
+		return body, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return body, false
+	}
+	items, ok := request["input"].([]any)
+	if !ok {
+		return body, false
+	}
+	normalized := make([]any, 0, len(items))
+	changed := false
+	for _, rawItem := range items {
+		item, _ := rawItem.(map[string]any)
+		if item != nil && providerHistoryIsRecoverableOrphanHostOutput(item, items) {
+			changed = true
+			continue
+		}
+		normalized = append(normalized, rawItem)
+	}
+	if !changed {
+		return body, false
+	}
+	request["input"] = normalized
+	normalizedBody, err := json.Marshal(request)
+	if err != nil {
+		return body, false
+	}
+	return normalizedBody, true
+}
+
 func hasSemanticHistoryValue(value any) bool {
 	switch typed := value.(type) {
 	case string:
@@ -408,7 +443,17 @@ func providerHistorySessionIDs(headers http.Header, payload []byte, metadata map
 }
 
 func (m *Manager) normalizeProviderHistoryAttempt(provider string, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
-	if m == nil || m.providerHistoryScopes == nil || (opts.SourceFormat != sdktranslator.FormatOpenAIResponse && opts.SourceFormat != sdktranslator.FormatCodex) {
+	if m == nil || (opts.SourceFormat != sdktranslator.FormatOpenAIResponse && opts.SourceFormat != sdktranslator.FormatCodex) {
+		return req, opts, nil
+	}
+	compatible, _ := opts.Metadata[cliproxyexecutor.SelectedModelCompatibilityMetadataKey].(bool)
+	if compatible {
+		if normalized, changed := dropRecoverableOrphanHostOutputs(req.Payload); changed {
+			req.Payload = bytes.Clone(normalized)
+			opts.OriginalRequest = bytes.Clone(normalized)
+		}
+	}
+	if m.providerHistoryScopes == nil {
 		return req, opts, nil
 	}
 	targetScope := ""

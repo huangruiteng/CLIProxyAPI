@@ -433,7 +433,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			responseSSELifecycle = nil
 			return
 		}
-		responseSSEValidator = &sseJSONValidationState{}
+		responseSSEValidator = &sseJSONValidationState{
+			canonicalizeCompleteFrames: responsesSSELifecycleEnabled(responseExecutionMetadata),
+		}
 		responseSSELifecycle = nil
 		if responsesSSELifecycleEnabled(responseExecutionMetadata) {
 			responseSSELifecycle = &responsesSSELifecycleState{}
@@ -761,8 +763,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 }
 
 type sseJSONValidationState struct {
-	pending    []byte
-	pendingErr error
+	pending                    []byte
+	pendingErr                 error
+	canonicalizeCompleteFrames bool
 }
 
 func (s *sseJSONValidationState) AddChunk(chunk []byte) ([]byte, error) {
@@ -811,8 +814,24 @@ func (s *sseJSONValidationState) AddChunk(chunk []byte) ([]byte, error) {
 	}
 	payload, found := sseJSONValidationDataPayload(s.pending)
 	payload = bytes.TrimSpace(payload)
-	if !found || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || json.Valid(payload) {
+	if !found || len(payload) == 0 {
 		output = append(output, s.pending...)
+		s.pending = s.pending[:0]
+	} else if bytes.Equal(payload, []byte("[DONE]")) || json.Valid(payload) {
+		output = append(output, s.pending...)
+		// Some Responses-compatible providers deliver one complete SSE event per
+		// executor chunk but omit the blank-line frame delimiter from that chunk.
+		// The validator already treats a complete JSON payload as an event
+		// boundary, so preserve that decision for downstream lifecycle filters by
+		// emitting a canonical delimiter. Without it, the lifecycle normalizer
+		// buffers every otherwise-valid event and fails the stream at EOF.
+		if s.canonicalizeCompleteFrames && !bytes.HasSuffix(s.pending, []byte("\n\n")) {
+			if bytes.HasSuffix(s.pending, []byte("\n")) {
+				output = append(output, '\n')
+			} else {
+				output = append(output, '\n', '\n')
+			}
+		}
 		s.pending = s.pending[:0]
 	}
 	return output, nil
