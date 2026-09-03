@@ -28,6 +28,7 @@ type providerHistoryNormalization struct {
 	Body           []byte
 	Changed        bool
 	DroppedItems   int
+	ProjectedItems int
 	StrippedFields int
 }
 
@@ -96,9 +97,10 @@ func normalizeProviderBoundResponseHistory(body []byte) (providerHistoryNormaliz
 		default:
 			return providerHistoryNormalization{}, &providerHistoryError{reason: "unsupported_history_item"}
 		}
-		if providerHistoryIsRecoverableOrphanHostOutput(item, items) {
+		if projected, okProjected := providerHistoryProjectRecoverableOrphanHostOutput(item, items); okProjected {
 			result.Changed = true
-			result.DroppedItems++
+			result.ProjectedItems++
+			normalized = append(normalized, projected)
 			continue
 		}
 
@@ -182,7 +184,33 @@ func providerHistoryIsRecoverableOrphanHostOutput(item map[string]any, items []a
 	return true
 }
 
-func dropRecoverableOrphanHostOutputs(body []byte) ([]byte, bool) {
+func providerHistoryProjectRecoverableOrphanHostOutput(item map[string]any, items []any) (map[string]any, bool) {
+	if !providerHistoryIsRecoverableOrphanHostOutput(item, items) {
+		return nil, false
+	}
+	output, present := item["output"]
+	if !present || !hasSemanticHistoryValue(output) {
+		return nil, false
+	}
+	content, isString := output.(string)
+	if !isString {
+		encoded, err := json.Marshal(output)
+		if err != nil {
+			return nil, false
+		}
+		content = string(encoded)
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": content,
+	}, true
+}
+
+func projectRecoverableOrphanHostOutputs(body []byte) ([]byte, bool) {
 	var request map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -200,8 +228,9 @@ func dropRecoverableOrphanHostOutputs(body []byte) ([]byte, bool) {
 	changed := false
 	for _, rawItem := range items {
 		item, _ := rawItem.(map[string]any)
-		if item != nil && providerHistoryIsRecoverableOrphanHostOutput(item, items) {
+		if projected, okProjected := providerHistoryProjectRecoverableOrphanHostOutput(item, items); item != nil && okProjected {
 			changed = true
+			normalized = append(normalized, projected)
 			continue
 		}
 		normalized = append(normalized, rawItem)
@@ -449,7 +478,7 @@ func (m *Manager) normalizeProviderHistoryAttempt(provider string, auth *Auth, r
 	}
 	compatible, _ := opts.Metadata[cliproxyexecutor.SelectedModelCompatibilityMetadataKey].(bool)
 	if compatible {
-		if normalized, changed := dropRecoverableOrphanHostOutputs(req.Payload); changed {
+		if normalized, changed := projectRecoverableOrphanHostOutputs(req.Payload); changed {
 			req.Payload = bytes.Clone(normalized)
 			opts.OriginalRequest = bytes.Clone(normalized)
 		}
